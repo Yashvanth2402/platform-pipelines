@@ -1,0 +1,345 @@
+# ============================================================
+# platform-deploy.yml
+# Lives in: org/platform-pipelines/.github/workflows/
+# Owned by: Platform Team
+# Called by: every app repo's deploy.yml via reusable workflow
+#
+# DO NOT modify without platform team review.
+# All 100+ repos depend on this file.
+# ============================================================
+
+name: Platform Deploy
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: "Docker image SHA tag to deploy (github.sha from ci.yml)"
+        required: true
+        type: string
+
+      repo_name:
+        description: "Short repo name (e.g. java-game-service)"
+        required: true
+        type: string
+
+      environment:
+        description: "Target environment: dev | test | staging | production"
+        required: true
+        type: string
+
+    secrets:
+      GCP_SA_KEY:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+      GCP_GITHUB_TOKEN:
+        required: true
+      # Optional — only needed if Jira notifications enabled
+      JIRA_TOKEN:
+        required: false
+      JIRA_URL:
+        required: false
+      JIRA_PROJECT_KEY:
+        required: false
+      # Environment URLs — used for smoke tests
+      # Each app repo sets these in GitHub repo secrets
+      DEV_URL:
+        required: false
+      TEST_URL:
+        required: false
+      STAGING_URL:
+        required: false
+      PROD_URL:
+        required: false
+
+# ─────────────────────────────────────────────────────────────
+# ENVIRONMENT MAPPING
+# dev       → GitHub environment "dev"       → no approval
+# test      → GitHub environment "test"      → no approval
+# staging   → GitHub environment "staging"   → 1 QA approval
+# production → GitHub environment "production" → 2 approvals
+#
+# Approval reviewers configured in GitHub org settings:
+#   Settings → Environments → staging/production → Required reviewers
+# ─────────────────────────────────────────────────────────────
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # VALIDATE INPUTS
+  # ─────────────────────────────────────────────
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate environment value
+        run: |
+          VALID_ENVS="dev test staging production"
+          if ! echo "$VALID_ENVS" | grep -w "${{ inputs.environment }}" > /dev/null; then
+            echo "ERROR: Invalid environment '${{ inputs.environment }}'"
+            echo "Must be one of: $VALID_ENVS"
+            exit 1
+          fi
+          echo "Environment: ${{ inputs.environment }} ✅"
+          echo "Image tag  : ${{ inputs.image_tag }} ✅"
+          echo "Repo name  : ${{ inputs.repo_name }} ✅"
+
+  # ─────────────────────────────────────────────
+  # DEPLOY
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: validate
+
+    # GitHub environment gate — approval rules configured in GitHub settings
+    # dev/test  → auto (no approval required)
+    # staging   → 1 QA approval required
+    # production → 2 approvals required
+    environment:
+      name: ${{ inputs.environment }}
+      url: >-
+        ${{
+          inputs.environment == 'production' && vars.PROD_URL ||
+          inputs.environment == 'staging'    && vars.STAGING_URL ||
+          inputs.environment == 'test'       && vars.TEST_URL ||
+          vars.DEV_URL
+        }}
+
+    permissions:
+      contents: write   # to commit helm values
+      id-token: write   # for GCP workload identity
+
+    steps:
+      # ── 1. Checkout the APP repo (not platform repo) ──────────
+      - name: Checkout ${{ inputs.repo_name }}
+        uses: actions/checkout@v4
+        with:
+          # Checkout the app repo, not the platform repo
+          repository: ${{ github.repository_owner }}/${{ inputs.repo_name }}
+          token: ${{ secrets.GCP_GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      # ── 2. Authenticate to GCP ────────────────────────────────
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # ── 3. Setup gcloud ───────────────────────────────────────
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ── 4. Verify image exists in registry ───────────────────
+      # This is the key safety check — we confirm the image was
+      # actually built and pushed before we try to deploy it.
+      - name: Verify image exists in Artifact Registry
+        run: |
+          IMAGE="us-central1-docker.pkg.dev/project-166a7983-818b-43fa-932/cicd-agent-repo/${{ inputs.repo_name }}:${{ inputs.image_tag }}"
+          echo "Verifying image: $IMAGE"
+          if gcloud artifacts docker images describe "$IMAGE" > /dev/null 2>&1; then
+            echo "Image verified ✅"
+          else
+            echo "ERROR: Image not found in registry: $IMAGE"
+            echo "Ensure ci.yml completed successfully and pushed the image."
+            exit 1
+          fi
+
+      # ── 5. Install yq ─────────────────────────────────────────
+      - name: Install yq
+        run: sudo snap install yq
+
+      # ── 6. Update helm values file for this environment ───────
+      # This is the ONLY thing that changes per deploy:
+      # the image tag in the correct values file.
+      - name: Update helm values — ${{ inputs.environment }}
+        run: |
+          # Map environment name to values file
+          case "${{ inputs.environment }}" in
+            dev)        VALUES_FILE="helm/values-dev.yaml" ;;
+            test)       VALUES_FILE="helm/values-test.yaml" ;;
+            staging)    VALUES_FILE="helm/values-staging.yaml" ;;
+            production) VALUES_FILE="helm/values-prod.yaml" ;;
+          esac
+
+          echo "Updating $VALUES_FILE with image tag: ${{ inputs.image_tag }}"
+
+          # Check values file exists
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "ERROR: $VALUES_FILE not found in repo."
+            echo "Please create this file to enable ${{ inputs.environment }} deployments."
+            exit 1
+          fi
+
+          # Update image tag
+          yq e '.image.tag = "${{ inputs.image_tag }}"' -i "$VALUES_FILE"
+          echo "Updated $VALUES_FILE ✅"
+          cat "$VALUES_FILE"
+
+      # ── 7. Commit and push → ArgoCD syncs automatically ───────
+      - name: Commit and push helm values
+        run: |
+          git config user.name  "platform-deploy-bot"
+          git config user.email "platform-deploy-bot@users.noreply.github.com"
+
+          case "${{ inputs.environment }}" in
+            dev)        VALUES_FILE="helm/values-dev.yaml" ;;
+            test)       VALUES_FILE="helm/values-test.yaml" ;;
+            staging)    VALUES_FILE="helm/values-staging.yaml" ;;
+            production) VALUES_FILE="helm/values-prod.yaml" ;;
+          esac
+
+          git add "$VALUES_FILE"
+
+          # Commit only if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit — image tag already up to date"
+          else
+            git commit -m "deploy(${{ inputs.environment }}): ${{ inputs.repo_name }} → ${{ inputs.image_tag }}
+
+Deployed by: platform-deploy-bot
+Environment: ${{ inputs.environment }}
+Triggered by: ${{ github.actor }}
+Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            git push
+            echo "Committed and pushed ✅"
+            echo "ArgoCD will sync ${{ inputs.environment }} automatically."
+          fi
+
+      # ── 8. Wait for ArgoCD to sync ────────────────────────────
+      # Give ArgoCD time to detect the commit and start syncing.
+      # For dev/test: 20s is enough (fast clusters)
+      # For staging/prod: 45s (more careful rollout)
+      - name: Wait for ArgoCD sync
+        run: |
+          case "${{ inputs.environment }}" in
+            dev|test)          WAIT=20 ;;
+            staging|production) WAIT=45 ;;
+          esac
+          echo "Waiting ${WAIT}s for ArgoCD to sync..."
+          sleep $WAIT
+
+      # ── 9. Smoke test ─────────────────────────────────────────
+      # Quick health check to confirm the app is actually running.
+      # Uses the URL from GitHub environment variables.
+      # Each app repo sets {ENV}_URL in GitHub repository secrets.
+      - name: Smoke test — ${{ inputs.environment }}
+        run: |
+          # Determine URL for this environment
+          case "${{ inputs.environment }}" in
+            dev)        ENV_URL="${{ secrets.DEV_URL }}" ;;
+            test)       ENV_URL="${{ secrets.TEST_URL }}" ;;
+            staging)    ENV_URL="${{ secrets.STAGING_URL }}" ;;
+            production) ENV_URL="${{ secrets.PROD_URL }}" ;;
+          esac
+
+          if [ -z "$ENV_URL" ]; then
+            echo "WARNING: No URL secret set for ${{ inputs.environment }}."
+            echo "Skipping smoke test. Set ${{ inputs.environment == 'production' && 'PROD_URL' || format('{0}_URL', upper(inputs.environment)) }} secret to enable."
+            exit 0
+          fi
+
+          echo "Running smoke test against: $ENV_URL"
+
+          # Try /health first (most frameworks), then /actuator/health (Spring Boot)
+          # then /healthz (Go), then root /
+          HEALTH_CHECK_PASSED=false
+
+          for ENDPOINT in "/health" "/actuator/health" "/healthz" "/api/health" "/"; do
+            echo "Trying $ENV_URL$ENDPOINT ..."
+            HTTP_STATUS=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+              --retry 5 \
+              --retry-delay 10 \
+              --retry-connrefused \
+              --max-time 30 \
+              "$ENV_URL$ENDPOINT" || echo "000")
+
+            if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "204" ]; then
+              echo "Smoke test passed ✅ ($ENV_URL$ENDPOINT returned $HTTP_STATUS)"
+              HEALTH_CHECK_PASSED=true
+              break
+            else
+              echo "  $ENDPOINT returned $HTTP_STATUS — trying next..."
+            fi
+          done
+
+          if [ "$HEALTH_CHECK_PASSED" = "false" ]; then
+            echo "ERROR: Smoke test failed — no health endpoint responded with 200"
+            echo "Check that the app started correctly in ${{ inputs.environment }}"
+            exit 1
+          fi
+
+      # ── 10. Deployment summary ────────────────────────────────
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "DEPLOYMENT SUCCESSFUL"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Repo       : ${{ inputs.repo_name }}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Image tag  : ${{ inputs.image_tag }}"
+          echo "Deployed by: ${{ github.actor }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # ─────────────────────────────────────────────
+  # NOTIFY SUCCESS
+  # ─────────────────────────────────────────────
+  notify-success:
+    name: Notify success
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: success()
+    steps:
+      - name: Slack — deploy success
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "✅ *Deploy succeeded*",
+              "attachments": [
+                {
+                  "color": "#36a64f",
+                  "fields": [
+                    { "title": "Repo",        "value": "${{ inputs.repo_name }}", "short": true },
+                    { "title": "Environment", "value": "${{ inputs.environment }}", "short": true },
+                    { "title": "Image tag",   "value": "${{ inputs.image_tag }}", "short": true },
+                    { "title": "Deployed by", "value": "${{ github.actor }}", "short": true }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ─────────────────────────────────────────────
+  # NOTIFY FAILURE
+  # ─────────────────────────────────────────────
+  notify-failure:
+    name: Notify failure
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure()
+    steps:
+      - name: Slack — deploy failed
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "❌ *Deploy FAILED*",
+              "attachments": [
+                {
+                  "color": "#ff0000",
+                  "fields": [
+                    { "title": "Repo",        "value": "${{ inputs.repo_name }}", "short": true },
+                    { "title": "Environment", "value": "${{ inputs.environment }}", "short": true },
+                    { "title": "Image tag",   "value": "${{ inputs.image_tag }}", "short": true },
+                    { "title": "Failed by",   "value": "${{ github.actor }}", "short": true },
+                    { "title": "Run URL",     "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
