@@ -152,7 +152,7 @@ jobs:
           case "${{ inputs.environment }}" in
             dev)        VALUES_FILE="helm/values-dev.yaml" ;;
             test)       VALUES_FILE="helm/values-test.yaml" ;;
-            staging)    VALUES_FILE="helm/values-staging.yaml" ;;
+            staging)    VALUES_FILE="helm/values-stage.yaml" ;;
             production) VALUES_FILE="helm/values-prod.yaml" ;;
           esac
 
@@ -175,7 +175,7 @@ jobs:
           case "${{ inputs.environment }}" in
             dev)        VALUES_FILE="helm/values-dev.yaml" ;;
             test)       VALUES_FILE="helm/values-test.yaml" ;;
-            staging)    VALUES_FILE="helm/values-staging.yaml" ;;
+            staging)    VALUES_FILE="helm/values-stage.yaml" ;;
             production) VALUES_FILE="helm/values-prod.yaml" ;;
           esac
 
